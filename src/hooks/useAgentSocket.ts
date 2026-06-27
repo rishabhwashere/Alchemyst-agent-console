@@ -1,85 +1,184 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { ServerMessage, ClientMessage } from '../types/protocol';
 
+export type ActiveTool = {
+  call_id: string;
+  name: string;
+  args: Record<string, unknown>;
+} | null;
+
+export type EventLog = {
+  id: string;
+  type: string;
+  summary: string;
+  raw: any;
+  count: number;
+};
+
 const SOCKET_URL = 'ws://localhost:4747/ws';
 
 export function useAgentSocket() {
   const [isConnected, setIsConnected] = useState(false);
+  const [streamedText, setStreamedText] = useState('');
+  const [activeTool, setActiveTool] = useState<ActiveTool>(null);
+  const [logs, setLogs] = useState<EventLog[]>([]);
+
   
-  // 1. Add state to hold the incoming text
-  const [streamedText, setStreamedText] = useState(""); 
+  // NEW: State to hold the massive AI brain dump
+  const [contextSnapshot, setContextSnapshot] = useState<Record<string, unknown> | null>(null);
   
   const wsRef = useRef<WebSocket | null>(null);
+  
+  // NEW: Chaos Mode Survival State
+  const nextSeqRef = useRef<number>(1);
+  const bufferRef = useRef<Map<number, ServerMessage>>(new Map());
+  const isIntentionalDisconnect = useRef<boolean>(false);
 
   const sendMessage = useCallback((msg: ClientMessage) => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(msg));
-    } else {
-      console.warn("Attempted to send message, but socket is not open:", msg);
     }
   }, []);
 
-  useEffect(() => {
-    if (wsRef.current) return;
+  const connect = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.CONNECTING || wsRef.current?.readyState === WebSocket.OPEN) {
+      return;
+    }
 
     const ws = new WebSocket(SOCKET_URL);
     wsRef.current = ws;
 
     ws.onopen = () => {
-      console.log('Connected to Agent Server');
       setIsConnected(true);
+      
+      // RECOVERY: If we already processed messages, ask the server to catch us up!
+      if (nextSeqRef.current > 1) {
+        console.log(`Reconnected! Requesting resume from seq: ${nextSeqRef.current - 1}`);
+        ws.send(JSON.stringify({ type: 'RESUME', last_seq: nextSeqRef.current - 1 }));
+      }
     };
 
     ws.onclose = () => {
-      console.log('Disconnected from Agent Server');
       setIsConnected(false);
       wsRef.current = null;
+      
+      // AUTO-RECONNECT: If the server dropped us (not a manual close), try again in 1 second
+      if (!isIntentionalDisconnect.current) {
+        console.warn("Connection lost. Reconnecting in 1s...");
+        setTimeout(connect, 1000);
+      }
     };
 
-    ws.onmessage = (event) => {
+   ws.onmessage = (event) => {
       try {
-        const message = JSON.parse(event.data);
+        const message: ServerMessage = JSON.parse(event.data);
         
-        // 1. Handle Heartbeats
+        // 1. NETWORK LAYER SURVIVAL: Always bounce PINGs instantly
         if (message.type === 'PING') {
-          // @ts-ignore
-          sendMessage({ type: 'PONG', echo: message.challenge });
-          return; 
+          ws.send(JSON.stringify({ type: 'PONG', echo: message.challenge || "" }));
         }
 
-        // 2. NEW: Handle Tool Acknowledgements to stop backend timeouts
-        // Assuming the backend sends 'TOOL_CALL' or similar when it wants an ACK
-        if (message.call_id && !message.type.includes('ACK')) {
-           // @ts-ignore - Instantly echo back an acknowledgement
-           sendMessage({ type: 'TOOL_ACK', call_id: message.call_id });
+        // 2. NETWORK LAYER SURVIVAL: Acknowledge tools instantly!
+        // We MUST send this back immediately to satisfy the server's 2-second timeout.
+        // We do this before the sequence buffer traps it.
+        if (message.type === 'TOOL_CALL') {
+          ws.send(JSON.stringify({ type: 'TOOL_ACK', call_id: message.call_id }));
         }
 
-        // 3. FIX: Catch the 'TOKEN' type and extract the 'text' property!
-        if (message.type === 'TOKEN') {
-          setStreamedText(prev => prev + (message.text || ""));
-        } 
-        // Optional: Catch a 'STREAM_END' or 'TOOL_RESULT' if you want to display those too
-        else if (message.type !== 'PING') {
-          console.log("Received other message:", message.type, message);
+        // 3. CHAOS FILTER: Ignore duplicate sequences sent by the server
+        if (message.seq < nextSeqRef.current) {
+          console.log(`Ignored duplicate message seq: ${message.seq}`);
+          return;
+        }
+
+        // 4. THE WAITING ROOM: Put the message in the buffer
+        bufferRef.current.set(message.seq, message);
+
+        // 5. THE UI PROCESSOR: Only render to the screen when in perfect order
+        while (bufferRef.current.has(nextSeqRef.current)) {
+          const msgToProcess = bufferRef.current.get(nextSeqRef.current)!;
+          bufferRef.current.delete(nextSeqRef.current);
+
+          // Apply to Timeline Logs
+          setLogs((prevLogs) => {
+            const newLogs = [...prevLogs];
+            const lastLog = newLogs[newLogs.length - 1];
+            if (msgToProcess.type === 'TOKEN' && lastLog?.type === 'TOKEN') {
+              lastLog.count += 1;
+              lastLog.summary = `Streamed ${lastLog.count} tokens`;
+              return newLogs;
+            }
+            newLogs.push({
+              id: Date.now().toString() + msgToProcess.seq,
+              type: msgToProcess.type,
+              summary: msgToProcess.type === 'TOKEN' ? 'Streamed 1 token' : `Received ${msgToProcess.type}`,
+              raw: msgToProcess,
+              count: 1
+            });
+            return newLogs.slice(-50);
+          });
+
+          // Apply to UI State
+          if (msgToProcess.type === 'TOKEN') {
+            setStreamedText((prev) => prev + msgToProcess.text);
+          }
+
+          if (msgToProcess.type === 'TOOL_CALL') {
+            // We still update the UI to show the card sequentially, 
+            // but we REMOVED the ws.send(TOOL_ACK) from here since we did it at Step 2!
+            setActiveTool({
+              call_id: msgToProcess.call_id,
+              name: msgToProcess.tool_name,
+              args: msgToProcess.args
+            });
+          }
+
+          if (msgToProcess.type === 'TOOL_RESULT') {
+            setActiveTool(null);
+          }
+          if (msgToProcess.type === 'CONTEXT_SNAPSHOT') {
+            setContextSnapshot(msgToProcess.data);
+          }
+
+          // Advance our expected sequence number
+          nextSeqRef.current += 1;
         }
 
       } catch (error) {
         console.error("Failed to parse incoming message:", error);
       }
     };
+  }, []);
+
+  // Initial connection
+  useEffect(() => {
+    isIntentionalDisconnect.current = false;
+    connect();
 
     return () => {
+      isIntentionalDisconnect.current = true;
       if (wsRef.current) {
         wsRef.current.close();
-        wsRef.current = null;
       }
     };
-  }, [sendMessage]);
+  }, [connect]);
+
+  // Expose a manual disconnect function if needed
+  const resetStream = useCallback(() => {
+    setStreamedText('');
+    setLogs([]);
+    setActiveTool(null);
+    nextSeqRef.current = 1;
+    bufferRef.current.clear();
+  }, []);
 
   return {
     isConnected,
+    streamedText,
+    activeTool,
+    logs,
+    contextSnapshot,
     sendMessage,
-    streamedText,     // Export the text for the UI
-    setStreamedText   // Export the setter so the UI can clear the screen
+    resetStream
   };
 }
